@@ -1,14 +1,6 @@
 variable "aws_access_key" {}
-
 variable "aws_secret_key" {}
-
-variable "ssh_public_key" {
-  description = <<DESCRIPTION
-Path to the SSH public key used for authentication and provisioning of AWS
-instances.  Ensure the key is added to a local ssh agent to transparently
-allow use of provisioners.
-  DESCRIPTION
-}
+variable "ssh_public_key" {}
 
 provider "aws" {
   region = "us-east-1"
