@@ -57,6 +57,14 @@ resource "aws_security_group" "cbo_sec_default" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  # Docker access for building images
+  ingress {
+    from_port = 0
+    to_port = 2375
+    protocol = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   egress {
     from_port = 0
     to_port = 0
