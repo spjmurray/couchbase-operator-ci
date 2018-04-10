@@ -83,18 +83,13 @@ resource "aws_instance" "cbo_kubernetes0" {
   subnet_id = "${aws_subnet.cbo_subnet.id}"
 
   # Copy over certificates to be used extenally
-  provisioner "remote-exec" {
-    inline = [
-      "mkdir docker",
-    ]
-  }
   provisioner "file" {
     source = "tls/server"
-    destination = "docker"
+    destination = "/home/ubuntu"
   }
   provisioner "remote-exec" {
     inline = [
-      "sudo mv docker /etc",
+      "sudo mv server /etc/docker",
     ]
   }
 
