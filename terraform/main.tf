@@ -89,6 +89,27 @@ resource "aws_instance" "cbo_kubernetes0" {
   key_name = "${aws_key_pair.cbo_keypair.id}"
   vpc_security_group_ids = ["${aws_security_group.cbo_sec_default.id}"]
   subnet_id = "${aws_subnet.cbo_subnet.id}"
+
+  # Copy over certificates to be used extenally
+  provisioner "remote-exec" {
+    inline = [
+      "sudo mkdir /etc/docker"
+    ]
+  }
+  provisioner "file" {
+    source = "ca.pem"
+    destination = "/etc/docker/ca.pem"
+  }
+  provisioner "file" {
+    source = "server-cert.pem"
+    destination = "/etc/docker/cert.pem"
+  }
+  provisioner "file" {
+    source = "server-key.pem"
+    destination = "/etc/docker/key.pem"
+  }
+
+  # Provision the kubernetes cluster with puppet
   provisioner "remote-exec" {
     inline = [
       "wget -q https://apt.puppet.com/puppetlabs-release-pc1-xenial.deb",
@@ -103,5 +124,5 @@ resource "aws_instance" "cbo_kubernetes0" {
 }
 
 output "kubernetes0" {
-  value = "${aws_instance.cbo_kubernetes0.public_ip}"
+  value = "${aws_instance.cbo_kubernetes0.public_dns}"
 }
