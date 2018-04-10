@@ -1,0 +1,152 @@
+#!/bin/bash -x
+
+# You must export the following variables
+# * AWS_ACCESS_KEY
+# * AWS_SECRET_KEY
+
+################################################################################
+# Simulate a Jenkins workspace
+################################################################################
+
+WORKSPACE="$(dirname ${BASH_SOURCE})/workspace"
+mkdir -p ${WORKSPACE}
+pushd ${WORKSPACE}
+
+################################################################################
+# Install Terraform
+################################################################################
+
+TERRAFORM_VERSION="0.11.6"
+TERRAFORM_PKG="terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+TERRAFORM_URL="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/${TERRAFORM_PKG}"
+TERRAFORM="./terraform"
+
+wget -q ${TERRAFORM_URL}
+unzip ${TERRAFORM_PKG}
+
+################################################################################
+# Generate an ephemeral ssh keypair
+################################################################################
+
+SSH_ID="id_rsa"
+
+mkdir ssh
+
+pushd ssh
+ssh-keygen -f ${SSH_ID} -N ""
+eval $(ssh-agent)
+ssh-add ${SSH_ID}
+popd
+
+SSH_PUB="ssh/${SSH_ID}.pub"
+
+################################################################################
+# Generate TLS certificates for docker
+################################################################################
+
+mkdir -p tls/{server,client}
+
+# Generate the self signed certificate
+pushd tls
+openssl genrsa -out ca-key.pem 2048
+openssl req -new -x509 -days 365 -key ca-key.pem -sha256 -out ca.pem -subj '/CN=Docker CA'
+
+# Generate the client certificate
+pushd client
+cp ../ca.pem .
+openssl genrsa -out key.pem 2048
+openssl req -new -key key.pem -out cert.csr -subj '/CN=Docker Client'
+cat > extfile.cnf <<EOF
+extendedKeyUsage = clientAuth
+EOF
+openssl x509 -req -days 365 -sha256 -in cert.csr -CA ca.pem -CAkey ../ca-key.pem -CAcreateserial -out cert.pem -extfile extfile.cnf
+rm ca.srl cert.csr extfile.cnf
+popd
+
+pushd server
+cp ../ca.pem .
+openssl genrsa -out key.pem
+openssl req -new -key key.pem -out cert.csr -subj '/CN=Docker Server'
+# This is specific to us-east-1!!
+cat > extfile.cnf <<EOF
+extendedKeyUsage = serverAuth
+subjectAltName = DNS:*.compute-1.amazonaws.com
+EOF
+openssl x509 -req -days 365 -sha256 -in cert.csr -CA ca.pem -CAkey ../ca-key.pem -CAcreateserial -out cert.pem -extfile extfile.cnf
+rm ca.srl cert.csr extfile.cnf
+popd
+popd
+
+################################################################################
+# Install and provision the terraform manifest
+################################################################################
+
+TERRAFORM_MANIFEST="https://raw.githubusercontent.com/spjmurray/couchbase-operator-ci/master/terraform/main.tf"
+
+wget -q --no-cache ${TERRAFORM_MANIFEST}
+${TERRAFORM} init
+${TERRAFORM} apply \
+  -var aws_access_key=${AWS_ACCESS_KEY} \
+  -var aws_secret_key=${AWS_SECRET_KEY} \
+  -var ssh_public_key=${SSH_PUB} \
+  -auto-approve
+
+################################################################################
+# Setup docker
+################################################################################
+
+MASTER=$(${TERRAFORM} output kubernetes0)
+
+export DOCKER_HOST="tcp://${MASTER}:2376"
+export DOCKER_TLS_VERIFY=1
+export DOCKER_CERT_PATH=${PWD}/tls/client
+
+################################################################################
+# Setup Kubernetes
+################################################################################
+
+scp ubuntu@${MASTER}:.kube/config kubeconfig
+# Change from private to public address
+sed -i.old "s|server:.*|server: https://${MASTER}:6443|" kubeconfig
+
+export KUBECONFIG=${PWD}/kubeconfig
+
+################################################################################
+# Setup couchbase operator
+################################################################################
+
+ssh ubuntu@${MASTER} wget -q https://raw.githubusercontent.com/spjmurray/couchbase-operator-ci/master/rbac.yaml
+ssh ubuntu@${MASTER} kubectl create -f rbac.yaml
+
+################################################################################
+# Install couchbase operator
+################################################################################
+
+pushd /home/simon/go/src/github.com/couchbase/couchbase-operator
+export GOPATH=/home/simon/go
+
+make container
+make test-sanity
+
+popd
+
+################################################################################
+# Cleanup cloud resources
+################################################################################
+
+${TERRAFORM} destroy \
+  -var aws_access_key=${AWS_ACCESS_KEY} \
+  -var aws_secret_key=${AWS_SECRET_KEY} \
+  -var ssh_public_key=${SSH_PUB} \
+  -auto-approve
+
+# Clean up ssh agent
+
+ssh-agent -k
+
+# Clean up workspace
+
+popd
+rm -rf ${WORKSPACE}
+
+# vi: ts=2 et:
