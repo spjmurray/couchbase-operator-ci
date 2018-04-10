@@ -93,20 +93,17 @@ resource "aws_instance" "cbo_kubernetes0" {
   # Copy over certificates to be used extenally
   provisioner "remote-exec" {
     inline = [
-      "sudo mkdir /etc/docker"
+      "mkdir docker",
     ]
   }
   provisioner "file" {
-    source = "ca.pem"
-    destination = "/etc/docker/ca.pem"
+    source = "tls/server"
+    destination = "docker"
   }
-  provisioner "file" {
-    source = "server-cert.pem"
-    destination = "/etc/docker/cert.pem"
-  }
-  provisioner "file" {
-    source = "server-key.pem"
-    destination = "/etc/docker/key.pem"
+  provisioner "remote-exec" {
+    inline = [
+      "sudo mv docker /etc",
+    ]
   }
 
   # Provision the kubernetes cluster with puppet
