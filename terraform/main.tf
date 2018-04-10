@@ -18,6 +18,8 @@ provider "aws" {
 
 resource "aws_vpc" "cbo_vpc" {
   cidr_block = "172.16.0.0/16"
+  enable_dns_support = true
+  enable_dns_hostnames = true
 }
 
 resource "aws_internet_gateway" "cbo_gateway" {
@@ -60,7 +62,7 @@ resource "aws_security_group" "cbo_sec_default" {
   # Docker access for building images
   ingress {
     from_port = 0
-    to_port = 2375
+    to_port = 2376
     protocol = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
