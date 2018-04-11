@@ -10,6 +10,8 @@
 
 WORKSPACE="$(dirname ${BASH_SOURCE})/workspace"
 mkdir -p ${WORKSPACE}
+cp terraform/main.tf ${WORKSPACE}
+cp kubernetes/rbac.yaml ${WORKSPACE}
 pushd ${WORKSPACE}
 
 ################################################################################
@@ -81,9 +83,6 @@ popd
 # Install and provision the terraform manifest
 ################################################################################
 
-TERRAFORM_MANIFEST="https://raw.githubusercontent.com/spjmurray/couchbase-operator-ci/master/terraform/main.tf"
-
-wget -q --no-cache ${TERRAFORM_MANIFEST}
 ${TERRAFORM} init
 ${TERRAFORM} apply \
   -var aws_access_key=${AWS_ACCESS_KEY} \
@@ -115,7 +114,7 @@ export KUBECONFIG=${PWD}/kubeconfig
 # Setup couchbase operator
 ################################################################################
 
-ssh ubuntu@${MASTER} wget -q https://raw.githubusercontent.com/spjmurray/couchbase-operator-ci/master/rbac.yaml
+scp rbac.yaml ubuntu@${MASTER}:
 ssh ubuntu@${MASTER} kubectl create -f rbac.yaml
 
 ################################################################################

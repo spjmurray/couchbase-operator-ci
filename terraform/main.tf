@@ -101,8 +101,7 @@ resource "aws_instance" "cbo_kubernetes0" {
       "sudo apt-get update",
       "sudo apt-get -y install puppet-agent",
       "sudo /opt/puppetlabs/bin/puppet module install spjmurray/kubernetes",
-      "wget -q https://raw.githubusercontent.com/spjmurray/couchbase-operator-ci/master/puppet/manifests/site.pp",
-      "sudo /opt/puppetlabs/bin/puppet apply site.pp",
+      "sudo /opt/puppetlabs/bin/puppet apply -e 'include ::kubernetes'",
     ]
   }
 }
