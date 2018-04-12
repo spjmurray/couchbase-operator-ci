@@ -94,7 +94,8 @@ ${TERRAFORM} apply \
 # Setup docker
 ################################################################################
 
-MASTER=$(${TERRAFORM} output kubernetes0)
+MASTER=$(${TERRAFORM} output kubernetes_master)
+SLAVES=$(${TERRAFORM} output kubernetes_slave | sed s/,//)
 
 export DOCKER_HOST="tcp://${MASTER}:2376"
 export DOCKER_TLS_VERIFY=1
@@ -124,7 +125,12 @@ ssh ubuntu@${MASTER} kubectl create -f rbac.yaml
 pushd /home/simon/go/src/github.com/couchbase/couchbase-operator
 export GOPATH=/home/simon/go
 
-make container
+# Add to each of the slave nodes
+for slave in ${SLAVES}; do
+  DOCKER_HOST="tcp://${slave}:2376" make container
+done
+
+# And finally test!
 make test-sanity
 
 popd

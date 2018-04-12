@@ -35,27 +35,10 @@ resource "aws_security_group" "cbo_sec_default" {
   description = "Kubernetes enabled security group"
   vpc_id = "${aws_vpc.cbo_vpc.id}"
 
-  # SSH access for provisioning and debug
   ingress {
     from_port = 0
-    to_port = 22
-    protocol = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # K8S access for testing via the API
-  ingress {
-    from_port = 0
-    to_port = 6443
-    protocol = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # Docker access for building images
-  ingress {
-    from_port = 0
-    to_port = 2376
-    protocol = "tcp"
+    to_port = 0
+    protocol = -1
     cidr_blocks = ["0.0.0.0/0"]
   }
 
@@ -72,14 +55,35 @@ resource "aws_key_pair" "cbo_keypair" {
   public_key = "${file(var.ssh_public_key)}"
 }
 
-resource "aws_instance" "cbo_kubernetes0" {
+data "aws_ami" "ubuntu_xenial" {
+  most_recent = true
+  filter {
+    name = "name"
+    values = [
+      "ubuntu/images/hvm-ssd/ubuntu-xenial-16.04-amd64-server-*",
+    ]
+  }
+  filter {
+    name = "virtualization-type"
+    values = [
+      "hvm",
+    ]
+  }
+  owners = [
+    "099720109477"
+  ]
+}
+
+resource "aws_instance" "cbo_kubernetes_master" {
   connection {
     user = "ubuntu"
   }
-  instance_type = "m4.large" # 2 vCPU, 8 GiB, EBS optimized, Moderate network
-  ami = "ami-43a15f3e" # Ubuntu 16.04
+  instance_type = "m4.large"
+  ami = "${data.aws_ami.ubuntu_xenial.id}"
   key_name = "${aws_key_pair.cbo_keypair.id}"
-  vpc_security_group_ids = ["${aws_security_group.cbo_sec_default.id}"]
+  vpc_security_group_ids = [
+    "${aws_security_group.cbo_sec_default.id}",
+  ]
   subnet_id = "${aws_subnet.cbo_subnet.id}"
 
   # Copy over certificates to be used extenally
@@ -106,6 +110,48 @@ resource "aws_instance" "cbo_kubernetes0" {
   }
 }
 
-output "kubernetes0" {
-  value = "${aws_instance.cbo_kubernetes0.public_dns}"
+resource "aws_instance" "cbo_kubernetes_slave" {
+  count = 3
+    connection {
+    user = "ubuntu"
+  }
+  instance_type = "m4.large"
+  ami = "${data.aws_ami.ubuntu_xenial.id}"
+  key_name = "${aws_key_pair.cbo_keypair.id}"
+  vpc_security_group_ids = [
+    "${aws_security_group.cbo_sec_default.id}"
+  ]
+  subnet_id = "${aws_subnet.cbo_subnet.id}"
+
+  # Copy over certificates to be used extenally
+  provisioner "file" {
+    source = "tls/server"
+    destination = "/home/ubuntu"
+  }
+  provisioner "remote-exec" {
+    inline = [
+      "sudo mv server /etc/docker",
+    ]
+  }
+
+  # Provision the kubernetes cluster with puppet
+  provisioner "remote-exec" {
+    inline = [
+      "wget -q https://apt.puppet.com/puppetlabs-release-pc1-xenial.deb",
+      "sudo dpkg -i puppetlabs-release-pc1-xenial.deb",
+      "sudo apt-get update",
+      "sudo apt-get -y install puppet-agent",
+      "sudo /opt/puppetlabs/bin/puppet module install spjmurray/kubernetes",
+      "sudo /opt/puppetlabs/bin/puppet apply -e \"class { 'kubernetes': type => 'slave', master => '${aws_instance.cbo_kubernetes_master.private_ip}' }\"",
+    ]
+  }
+}
+
+
+output "kubernetes_master" {
+  value = "${aws_instance.cbo_kubernetes_master.public_dns}"
+}
+
+output "kubernetes_slave" {
+  value = "${aws_instance.cbo_kubernetes_slave.*.public_dns}"
 }
