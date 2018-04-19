@@ -1,6 +1,22 @@
+# Secret or dynamic input variables
 variable "aws_access_key" {}
 variable "aws_secret_key" {}
 variable "ssh_public_key" {}
+
+# Local configuration
+locals {
+  # Our overlays will live in the 10.0.0.0/8 space
+  supernet_prefix = "172.16.0.0/16"
+  # Each AZ needs a subnet prefix
+  num_availability_zones = 3
+  subnet_prefixes = [
+    "172.16.0.0/24",
+    "172.16.1.0/24",
+    "172.16.2.0/24",
+  ]
+  # Number of K8S slaves to provision
+  num_slaves = 3
+}
 
 provider "aws" {
   region = "us-east-1"
@@ -9,7 +25,7 @@ provider "aws" {
 }
 
 resource "aws_vpc" "cbo_vpc" {
-  cidr_block = "172.16.0.0/16"
+  cidr_block = "${local.supernet_prefix}"
   enable_dns_support = true
   enable_dns_hostnames = true
 }
@@ -24,9 +40,13 @@ resource "aws_route" "cbo_default_route" {
   gateway_id = "${aws_internet_gateway.cbo_gateway.id}"
 }
 
+data "aws_availability_zones" "availability_zones" {}
+
 resource "aws_subnet" "cbo_subnet" {
+  count = "${local.num_availability_zones}"
   vpc_id = "${aws_vpc.cbo_vpc.id}"
-  cidr_block = "172.16.0.0/24"
+  cidr_block = "${element(local.subnet_prefixes, count.index)}"
+  availability_zone = "${element(data.aws_availability_zones.availability_zones.names, count.index)}"
   map_public_ip_on_launch = true
 }
 
@@ -84,7 +104,9 @@ resource "aws_instance" "cbo_kubernetes_master" {
   vpc_security_group_ids = [
     "${aws_security_group.cbo_sec_default.id}",
   ]
-  subnet_id = "${aws_subnet.cbo_subnet.id}"
+
+  # Install the master in the first subnet
+  subnet_id = "${aws_subnet.cbo_subnet.0.id}"
 
   # Copy over certificates to be used extenally
   provisioner "file" {
@@ -111,8 +133,8 @@ resource "aws_instance" "cbo_kubernetes_master" {
 }
 
 resource "aws_instance" "cbo_kubernetes_slave" {
-  count = 3
-    connection {
+  count = "${local.num_slaves}"
+  connection {
     user = "ubuntu"
   }
   instance_type = "m4.large"
@@ -121,7 +143,9 @@ resource "aws_instance" "cbo_kubernetes_slave" {
   vpc_security_group_ids = [
     "${aws_security_group.cbo_sec_default.id}"
   ]
-  subnet_id = "${aws_subnet.cbo_subnet.id}"
+
+  # Distribute slaves over all availability zones
+  subnet_id = "${element(aws_subnet.cbo_subnet.*.id, count.index)}"
 
   # Copy over certificates to be used extenally
   provisioner "file" {

@@ -4,6 +4,15 @@
 # * AWS_ACCESS_KEY
 # * AWS_SECRET_KEY
 
+if [[ -z ${AWS_ACCESS_KEY} ]]; then
+  echo "Please set AWS_ACCESS_KEY"
+  exit 1
+fi
+if [[ -z ${AWS_SECRET_KEY} ]]; then
+  echo "Please set AWS_SECRET_KEY"
+  exit 1
+fi
+
 ################################################################################
 # Simulate a Jenkins workspace
 ################################################################################
