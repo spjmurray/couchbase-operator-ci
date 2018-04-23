@@ -1,4 +1,4 @@
-# Couchbase Operator Function Test
+# Couchbase Operator Functional Test
 
 This project uses Terraform and Puppet to provision a fully functional Kubernetes cluster in AWS, install Couchbase Operator and run functional tests against the cluster.  The project is self contained in that it requires no packages above and beyond those installed by default on an Ubuntu image, which makes it well suited to operation in Jenkins as a CI job.
 
