@@ -13,6 +13,8 @@ if [[ -z ${AWS_SECRET_KEY} ]]; then
   exit 1
 fi
 
+REGION="us-east-1"
+
 ################################################################################
 # Simulate a Jenkins workspace
 ################################################################################
@@ -74,14 +76,19 @@ openssl x509 -req -days 365 -sha256 -in cert.csr -CA ca.pem -CAkey ../ca-key.pem
 rm ca.srl cert.csr extfile.cnf
 popd
 
+# Handle Amazon's special snowflake
+SAN="DNS:*.${REGION}.compute.amazonaws.com"
+if [[ ${REGION} == "us-east-1" ]]; then
+  SAN="DNS:*.compute-1.amazonaws.com"
+fi
+
 pushd server
 cp ../ca.pem .
 openssl genrsa -out key.pem
 openssl req -new -key key.pem -out cert.csr -subj '/CN=Docker Server'
-# This is specific to us-east-1!!
 cat > extfile.cnf <<EOF
 extendedKeyUsage = serverAuth
-subjectAltName = DNS:*.compute-1.amazonaws.com
+subjectAltName = ${SAN}
 EOF
 openssl x509 -req -days 365 -sha256 -in cert.csr -CA ca.pem -CAkey ../ca-key.pem -CAcreateserial -out cert.pem -extfile extfile.cnf
 rm ca.srl cert.csr extfile.cnf
@@ -97,6 +104,7 @@ ${TERRAFORM} apply \
   -var aws_access_key=${AWS_ACCESS_KEY} \
   -var aws_secret_key=${AWS_SECRET_KEY} \
   -var ssh_public_key=${SSH_PUB} \
+  -var region=${REGION} \
   -auto-approve
 
 ################################################################################

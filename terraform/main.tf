@@ -2,6 +2,7 @@
 variable "aws_access_key" {}
 variable "aws_secret_key" {}
 variable "ssh_public_key" {}
+variable "region" {}
 
 # Local configuration
 locals {
@@ -19,7 +20,7 @@ locals {
 }
 
 provider "aws" {
-  region = "us-east-1"
+  region = "${var.region}"
   access_key = "${var.aws_access_key}"
   secret_key = "${var.aws_secret_key}"
 }
