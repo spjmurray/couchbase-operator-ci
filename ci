@@ -1,174 +1,557 @@
-#!/bin/bash -x
+#!/usr/bin/env python
+"""
+Couchbase Operator Continuous Integration
 
-# You must export the following variables
-# * AWS_ACCESS_KEY
-# * AWS_SECRET_KEY
+Main Docker entry point, responsible for spinning up a Kubernetes cluster
+dynamically in the cloud with Kops and running tests against it with tco
+"""
 
-if [[ -z ${AWS_ACCESS_KEY} ]]; then
-  echo "Please set AWS_ACCESS_KEY"
-  exit 1
-fi
-if [[ -z ${AWS_SECRET_KEY} ]]; then
-  echo "Please set AWS_SECRET_KEY"
-  exit 1
-fi
+import base64
+import configparser
+import errno
+import json
+import logging
+import os
+import random
+import signal
+import string
+import subprocess
+import sys
+import time
+import unittest
 
-REGION="us-east-1"
+import boto3
+import kubernetes
 
-################################################################################
-# Simulate a Jenkins workspace
-################################################################################
+# What this app is called
+APP = 'couchbase-operator-ci'
 
-WORKSPACE="$(dirname ${BASH_SOURCE})/workspace"
-mkdir -p ${WORKSPACE}
-cp terraform/main.tf ${WORKSPACE}
-cp kubernetes/rbac.yaml ${WORKSPACE}
-pushd ${WORKSPACE}
+# Where we expect the source to be mounted
+OPERATOR_MNT_DIR = '/mnt/couchbase-operator'
 
-################################################################################
-# Install Terraform
-################################################################################
+# Where we will make a working copy of the source
+OPERATOR_SRC_DIR = '/tmp/go/src/github.com/couchbase/couchbase-operator'
 
-TERRAFORM_VERSION="0.11.6"
-TERRAFORM_PKG="terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
-TERRAFORM_URL="https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/${TERRAFORM_PKG}"
-TERRAFORM="./terraform"
+class Argument(object):
+    """
+    Represents an environment argument
+    """
+    def __init__(self, name, required, default):
+        self.name = name
+        self.required = required
+        self.default = default
 
-wget -q ${TERRAFORM_URL}
-unzip ${TERRAFORM_PKG}
 
-################################################################################
-# Generate an ephemeral ssh keypair
-################################################################################
+class ArgumentList(object):
+    """
+    Holds parsed arguments, returns None if one doesn't exist
+    """
+    def __getattr__(self, key):
+        getattr(self.__dict__, key, None)
 
-SSH_ID="id_rsa"
 
-mkdir ssh
+class ArgumentParser(object):
+    """
+    Argument parser which has the same interface as argparse.ArgumentParser
+    but works on environment variables
+    """
+    def __init__(self):
+        self.arguments = []
 
-pushd ssh
-ssh-keygen -f ${SSH_ID} -N ""
-eval $(ssh-agent)
-ssh-add ${SSH_ID}
-popd
+    def add_argument(self, name, required=False, default=None):
+        """Adds a named environment variable to the internal collection"""
+        self.arguments.append(Argument(name, required, default))
 
-SSH_PUB="ssh/${SSH_ID}.pub"
+    def print_error(self):
+        """Prints the expected environment variables and exits"""
+        required = [x.name for x in self.arguments if x.required]
+        logging.error("Required arguments: %s", ', '.join(required))
+        sys.exit(1)
 
-################################################################################
-# Generate TLS certificates for docker
-################################################################################
+    def parse_args(self):
+        """Scans each defined argument, and parses into an output object"""
+        args = ArgumentList()
+        for argument in self.arguments:
+            try:
+                value = os.environ[argument.name]
+            except KeyError:
+                if argument.required:
+                    self.print_error()
+                elif argument.default != None:
+                    value = argument.default
+            setattr(args, argument.name.lower(), value)
+        return args
 
-mkdir -p tls/{server,client}
 
-# Generate the self signed certificate
-pushd tls
-openssl genrsa -out ca-key.pem 2048
-openssl req -new -x509 -days 365 -key ca-key.pem -sha256 -out ca.pem -subj '/CN=Docker CA'
+class Executor(object):
+    """
+    Helper functions for execution of external commands
+    """
 
-# Generate the client certificate
-pushd client
-cp ../ca.pem .
-openssl genrsa -out key.pem 2048
-openssl req -new -key key.pem -out cert.csr -subj '/CN=Docker Client'
-cat > extfile.cnf <<EOF
-extendedKeyUsage = clientAuth
-EOF
-openssl x509 -req -days 365 -sha256 -in cert.csr -CA ca.pem -CAkey ../ca-key.pem -CAcreateserial -out cert.pem -extfile extfile.cnf
-rm ca.srl cert.csr extfile.cnf
-popd
+    @staticmethod
+    def _execute(command, env):
+        """Execute a command returning the exit code and output"""
+        logging.debug('Executing command: %s', ' '.join(command))
+        proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        stdout, stderr = proc.communicate()
+        return proc.returncode, stdout, stderr
 
-# Handle Amazon's special snowflake
-SAN="DNS:*.${REGION}.compute.amazonaws.com"
-if [[ ${REGION} == "us-east-1" ]]; then
-  SAN="DNS:*.compute-1.amazonaws.com"
-fi
+    @staticmethod
+    def execute(command, env=None):
+        """Execute a command saving the output to the debug logs"""
 
-pushd server
-cp ../ca.pem .
-openssl genrsa -out key.pem
-openssl req -new -key key.pem -out cert.csr -subj '/CN=Docker Server'
-cat > extfile.cnf <<EOF
-extendedKeyUsage = serverAuth
-subjectAltName = ${SAN}
-EOF
-openssl x509 -req -days 365 -sha256 -in cert.csr -CA ca.pem -CAkey ../ca-key.pem -CAcreateserial -out cert.pem -extfile extfile.cnf
-rm ca.srl cert.csr extfile.cnf
-popd
-popd
+        returncode, stdout, stderr = Executor._execute(command, env=env)
+        logging.debug('stdout: \n%s', stdout)
+        logging.debug('stderr: \n%s', stderr)
+        if returncode != 0:
+            raise RuntimeError
+        return stdout, stderr
 
-################################################################################
-# Install and provision the terraform manifest
-################################################################################
 
-${TERRAFORM} init
-${TERRAFORM} apply \
-  -var aws_access_key=${AWS_ACCESS_KEY} \
-  -var aws_secret_key=${AWS_SECRET_KEY} \
-  -var ssh_public_key=${SSH_PUB} \
-  -var region=${REGION} \
-  -auto-approve
+class TimeoutError(Exception):
+    """Exception representing a timeout"""
+    pass
 
-################################################################################
-# Setup docker
-################################################################################
 
-MASTER=$(${TERRAFORM} output kubernetes_master)
-SLAVES=$(${TERRAFORM} output kubernetes_slave | sed s/,//)
+class Waiter(object):
+    """
+    Helper functions for waiting
+    """
 
-export DOCKER_HOST="tcp://${MASTER}:2376"
-export DOCKER_TLS_VERIFY=1
-export DOCKER_CERT_PATH=${PWD}/tls/client
+    @staticmethod
+    def _signal_handler(*_):
+        raise TimeoutError
 
-################################################################################
-# Setup Kubernetes
-################################################################################
+    @staticmethod
+    def wait_for(message, callback, interval=5, timeout=60):
+        """Wait for a callback to return True"""
 
-scp ubuntu@${MASTER}:.kube/config kubeconfig
-# Change from private to public address
-sed -i.old "s|server:.*|server: https://${MASTER}:6443|" kubeconfig
+        # Echo out the message
+        sys.stdout.write(message + ' ')
+        sys.stdout.flush()
 
-export KUBECONFIG=${PWD}/kubeconfig
+        # Setup our signal handler to catch timeouts and set the alarm
+        signal.signal(signal.SIGALRM, Waiter._signal_handler)
+        signal.alarm(timeout)
 
-################################################################################
-# Setup couchbase operator
-################################################################################
+        start = time.time()
 
-scp rbac.yaml ubuntu@${MASTER}:
-ssh ubuntu@${MASTER} kubectl create -f rbac.yaml
+        while True:
+            if callback():
+                # Cancel the alarm so we don't raise an exception
+                signal.alarm(0)
+                break
 
-################################################################################
-# Install couchbase operator
-################################################################################
+            sys.stdout.write('.')
+            sys.stdout.flush()
+            time.sleep(interval)
 
-pushd /home/simon/go/src/github.com/couchbase/couchbase-operator
-export GOPATH=/home/simon/go
+        delta = time.time() - start
 
-# Add to each of the slave nodes
-for slave in ${SLAVES}; do
-  DOCKER_HOST="tcp://${slave}:2376" make container
-done
+        sys.stdout.write(' success in {:3f}s\n'.format(delta))
+        sys.stdout.flush()
 
-# And finally test!
-make test-sanity
 
-popd
+class Kops(object):
+    """
+    Wraps up kops commands
+    """
 
-################################################################################
-# Cleanup cloud resources
-################################################################################
+    def __init__(self, testcase):
+        self.testcase = testcase
 
-${TERRAFORM} destroy \
-  -var aws_access_key=${AWS_ACCESS_KEY} \
-  -var aws_secret_key=${AWS_SECRET_KEY} \
-  -var ssh_public_key=${SSH_PUB} \
-  -auto-approve
+    def create(self, state, arguments, cluster_name):
+        """Create a cluster"""
 
-# Clean up ssh agent
+        # Ignore DNS
+        cluster_name = cluster_name + '.k8s.local'
 
-ssh-agent -k
+        create_command = ['kops', 'create', 'cluster', '--yes', '--state', state]
+        create_command += arguments
+        create_command += [cluster_name]
 
-# Clean up workspace
+        delete_comamnd = ['kops', 'delete', 'cluster', '--yes', '--state', state, cluster_name]
 
-popd
-rm -rf ${WORKSPACE}
+        logging.info('Creating cluster %s', cluster_name)
+        logging.warning(' '.join(delete_comamnd))
 
-# vi: ts=2 et:
+        Executor.execute(create_command)
+        #self.testcase.addCleanup(Executor.execute, delete_comamnd)
+
+        # Wait for the cluster to become available
+        def callback():
+            """Poll the cluster status, waiting until all nodes are up and ready"""
+            try:
+                Executor.execute(['kops', 'validate', 'cluster', '--state', state])
+            except RuntimeError:
+                return False
+            return True
+
+        Waiter.wait_for('Cluster provisioning', callback, timeout=600)
+
+
+class AWSBackend(object):
+    """
+    Backend for creating Kubernetes clusters in AWS
+    """
+    def __init__(self, testcase):
+        self.testcase = testcase
+        self.args = None
+        self.suffix = None
+        self.bucket_name = None
+        self.kops_parameters = []
+        self.kops_state = {}
+        self.cluster_name = None
+
+    def _configure_aws_args(self):
+        """Parse environment specific parameters"""
+
+        parser = ArgumentParser()
+        parser.add_argument('AWS_REGION', required=True)
+        parser.add_argument('AWS_ACCESS_KEY', required=True)
+        parser.add_argument('AWS_SECRET_KEY', required=True)
+        self.args = parser.parse_args()
+
+    def _configure_aws_command(self):
+        """Configure the environment for use AWS"""
+
+        aws_config_dir = self.testcase.args.home + '/.aws'
+        aws_config_path = aws_config_dir + '/config'
+        aws_credentials_path = aws_config_dir + '/credentials'
+
+        # Create the aws configuration needed by boto and kops
+        # May already exist for testing purposes
+        try:
+            logging.info('Creating AWS configuration directory %s', aws_config_dir)
+            os.mkdir(aws_config_dir)
+        except OSError as error:
+            if error.errno != errno.EEXIST:
+                raise error
+
+        if not os.access(aws_config_path, os.F_OK):
+            logging.info('Creating AWS configuration file %s', aws_config_path)
+            aws_config = configparser.RawConfigParser()
+            aws_config.add_section('default')
+            aws_config.set('default', 'region', self.args.aws_region)
+            with open(aws_config_path, 'w') as filedesc:
+                aws_config.write(filedesc)
+
+        if not os.access(aws_credentials_path, os.F_OK):
+            logging.info('Creating AWS credentials file %s', aws_credentials_path)
+            aws_credentials = configparser.RawConfigParser()
+            aws_credentials.add_section('default')
+            aws_credentials.set('default', 'aws_access_key_id', self.args.aws_access_key)
+            aws_credentials.set('default', 'aws_secret_access_key', self.args.aws_secret_key)
+            with open(aws_credentials_path, 'w') as filedesc:
+                aws_credentials.write(filedesc)
+
+    def _configure_aws_resources(self):
+        """Configure resources required for kops"""
+
+        # Create an S3 bucket to hold the configuration
+        self.bucket_name = APP + '-' + self.testcase.suffix
+        logging.info('Creating bucket %s', self.bucket_name)
+        aws_s3 = boto3.client('s3')
+        aws_s3.create_bucket(Bucket=self.bucket_name)
+        #self.testcase.addCleanup(aws_s3.delete_bucket, Bucket=self.bucket_name)
+
+        self.kops_state = 's3://' + self.bucket_name
+
+        logging.warning('aws s3api delete-bucket --bucket %s', self.bucket_name)
+
+    def _configure_aws_kops(self):
+        """Configures kops command line for AWS"""
+
+        # Poll the region to get availability zones
+        aws_ec2 = boto3.client('ec2')
+        zones = aws_ec2.describe_availability_zones()[u'AvailabilityZones']
+        zones = [zone[u'ZoneName'] for zone in zones if zone[u'State'] == 'available']
+
+        self.kops_parameters += [
+            '--node-count', '3',
+            '--zones', ','.join(zones[:3]),
+            '--master-zones', zones[0],
+        ]
+
+    def _configure(self):
+        """Configures all kops pre-requisites"""
+
+        self._configure_aws_args()
+        self._configure_aws_command()
+        self._configure_aws_resources()
+        self._configure_aws_kops()
+
+    def create_cluster(self):
+        """Perform all initialisation and create a cluster"""
+
+        self._configure()
+        self.cluster_name = APP + '-' + self.testcase.suffix
+
+        kops = Kops(self.testcase)
+        kops.create(self.kops_state, self.kops_parameters, self.cluster_name)
+
+
+class BackendFactory(object):
+    """
+    Builds backends based on top level configuration
+    """
+
+    @staticmethod
+    def build(testcase):
+        """Returns an initialized backend"""
+        if testcase.args.backend == 'aws':
+            return AWSBackend(testcase)
+        raise RuntimeError('Unknown backend ' + testcase.args.backend)
+
+
+class ConsoleLogFilter(logging.Filter):
+    """
+    Filter to inhibit log levels lower than INFO
+    """
+
+    def filter(self, record):
+        """Returns True if the level is greater than or equal to INFO"""
+
+        # Highlight warnings
+        if record.levelno >= logging.WARNING:
+            record.msg = '\x1b[1m' + record.msg + '\x1b[0m'
+
+        return record.levelno >= logging.INFO
+
+
+class TestMain(unittest.TestCase):
+    """
+    The main test case, this is a wrapper around the main go tests
+    which creates an ephemeral cluster.
+    """
+
+    def __init__(self, methodname='runTest'):
+        super(TestMain, self).__init__(methodname)
+        self.args = None
+        self.suffix = None
+        self.tag = None
+
+    def _init_logging(self):
+        """Creates info logging to stdout and debug loggin to a log file"""
+
+        # By default capture everything
+        logging.getLogger().setLevel(logging.DEBUG)
+
+        # Everything goes to log files
+        formatter = logging.Formatter(
+            fmt='%(asctime)s.%(msecs)03d %(process)d %(levelname)s %(name)s %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S')
+        handler = logging.FileHandler('/tmp/' + APP + '.log')
+        handler.setFormatter(formatter)
+        logging.getLogger().addHandler(handler)
+
+        # Only INFO or above goes to stdout
+        formatter = logging.Formatter(fmt='%(message)s')
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(formatter)
+        handler.addFilter(ConsoleLogFilter())
+        logging.getLogger().addHandler(handler)
+
+    def _init_common(self):
+        """Generates common runtime things like ephemeral keys and configuration"""
+
+        # Generate a random suffix for resource names to avoid conflicts
+        alphabet = string.ascii_lowercase + string.digits
+        self.suffix = ''.join(random.choice(alphabet) for i in range(0, 8))
+
+        # Generate an ephemeral SSH key
+        logging.info('Creating ephemeral key pair')
+        Executor.execute(['ssh-keygen', '-f', self.args.home + '/.ssh/id_rsa', '-N', ''])
+
+        # Generate docker login information
+        logging.info('Creating docker configuration')
+        docker_config = {
+            'auths': {
+                'https://index.docker.io/v1/': {
+                    'auth': base64.b64encode('spjmurray:' + self.args.docker_api_key),
+                },
+            },
+        }
+        docker_config_dir = self.args.home + '/.docker'
+        os.mkdir(docker_config_dir)
+        with open(docker_config_dir + '/config.json', 'w') as filedesc:
+            json.dump(docker_config, filedesc, indent=2)
+
+    def _init_build(self):
+        """
+        Build the container image
+        First we clone the repository so we can continue work while the job is running.
+        Then the image is built in docker.  We have to bind to the host docker as running
+        docker inside docker is nearly impossible.  We tag as the remote repository
+        on docker hub to avoid collisions.  The version is based on a git SHA, so ensure
+        test code is committed before running this job.  Finally the container is pushed
+        to the upstream repo.
+        """
+
+        # Clone the source so we don't affect the host file system during the run
+        logging.info('Cloning source repository')
+        os.makedirs(os.path.dirname(OPERATOR_SRC_DIR))
+
+        # We have a private fork of the operator-sdk which prevents this from working
+        #clone_cmd = ['git', 'clone', OPERATOR_MNT_DIR, OPERATOR_SRC_DIR]
+        clone_cmd = ['cp', '-a', OPERATOR_MNT_DIR, OPERATOR_SRC_DIR]
+        Executor.execute(clone_cmd)
+
+        # Move to the correct directory
+        os.chdir(OPERATOR_SRC_DIR)
+
+        # Get the git sha
+        sha, _ = Executor.execute(['git', 'rev-parse', 'HEAD'])
+        sha = sha.rstrip()
+
+        # Calculate the image tag
+        self.tag = 'spjmurray/couchbase-operator:' + sha
+
+        # Build the operator docker image
+        logging.info('Creating operator container image')
+        env = os.environ.copy()
+        env['GOPATH'] = '/tmp/go'
+        Executor.execute(['make'], env=env)
+        Executor.execute(['docker', 'build', '.', '-t', self.tag])
+
+        # Push it to a repository
+        logging.info('Pushing operator container image %s to docker hub', self.tag)
+        Executor.execute(['docker', 'push', self.tag])
+
+    def _init_tco(self):
+        """
+        Perform basic configuration of the TCO command
+        """
+        tco_config_dir = os.environ['HOME'] + '/.tco'
+        os.makedirs(tco_config_dir)
+        with open(tco_config_dir + '/config', mode='w') as tco_conf:
+            tco_conf.write("---\nrepo: " + OPERATOR_SRC_DIR + "\n")
+
+    def _init_cluster(self):
+        """
+        Sets up the cluster ready for a test run.
+        This is done in the 'cloud native' way by deploying a daemon set on the cluster
+        which then pulls the image down from the public repository and then tags it to
+        what the test suite is expecting.  We can then use the Kubernetes API to ensure
+        the image is successfully installed on all nodes.
+        """
+
+        # We are creating a daemon that runs on all nodes.  It runs privileged so it
+        # has access to the host docker socket in order to pull down the image.  Once
+        # complete it just sleeps forever.
+        daemon_set = kubernetes.client.V1beta1DaemonSet(
+            metadata=kubernetes.client.V1ObjectMeta(
+                name='couchbase-operator-installer',
+                namespace='kube-system',
+            ),
+            spec=kubernetes.client.V1beta1DaemonSetSpec(
+                selector=kubernetes.client.V1LabelSelector(
+                    match_labels={
+                        'app': 'couchbase-operator-installer',
+                    },
+                ),
+                template=kubernetes.client.V1PodTemplateSpec(
+                    metadata=kubernetes.client.V1ObjectMeta(
+                        labels={
+                            'app': 'couchbase-operator-installer',
+                        },
+                    ),
+                    spec=kubernetes.client.V1PodSpec(
+                        containers=[
+                            kubernetes.client.V1Container(
+                                name='couchbase-operator-installer',
+                                image='docker:latest',
+                                security_context=kubernetes.client.V1SecurityContext(
+                                    privileged=True,
+                                ),
+                                command=[
+                                    '/bin/sh',
+                                    '-c',
+                                    '''
+                                    set -o xtrace
+                                    docker pull {0}
+                                    docker tag {0} couchbase/couchbase-operator:v1
+                                    while true
+                                    do
+                                      sleep 60
+                                    done
+                                    '''.format(self.tag),
+                                ],
+                                volume_mounts=[
+                                    kubernetes.client.V1VolumeMount(
+                                        name='docker-socket',
+                                        mount_path='/var/run/docker.sock',
+                                    ),
+                                ],
+                            ),
+                        ],
+                        volumes=[
+                            kubernetes.client.V1Volume(
+                                name='docker-socket',
+                                host_path=kubernetes.client.V1HostPathVolumeSource(
+                                    path='/var/run/docker.sock',
+                                ),
+                            ),
+                        ],
+                    ),
+                ),
+            ),
+        )
+
+        # Deploy it to the cluster
+        logging.info('Pulling operator docker image to the cluster')
+        kubernetes.config.load_kube_config()
+        apps_v1 = kubernetes.client.AppsV1Api()
+        apps_v1.create_namespaced_daemon_set('kube-system', daemon_set)
+
+        # Wait for all nodes to show the image
+        def callback():
+            """Poll all nodes and ensure the operator image is installed"""
+            core_v1 = kubernetes.client.CoreV1Api()
+            nodes = core_v1.list_node()
+            for node in nodes.items:
+                # Ignore masters, the daemon set will not get scheduled there
+                if 'node-role.kubernetes.io/master' in node.metadata.labels:
+                    continue
+                # Collect all image names on this node and ensure the operator is installed
+                images = [name for image in node.status.images for name in image.names]
+                if not 'couchbase/couchbase-operator:v1' in images:
+                    return False
+            return True
+
+        Waiter.wait_for('Operator image installing', callback)
+
+    def test_main(self):
+        """Creates a cluster via kops and runs the test suite"""
+
+        # Parse the environment for common parameters
+        parser = ArgumentParser()
+        parser.add_argument('BACKEND', default='aws')
+        parser.add_argument('DOCKER_API_KEY', required=True)
+        parser.add_argument('HOME', required=True)
+        self.args = parser.parse_args()
+
+        # Setup logging to standard out
+        self._init_logging()
+
+        # Generate common dependencies
+        self._init_common()
+
+        # Build the docker image
+        self._init_build()
+
+        # Configure the tools
+        self._init_tco()
+
+        # Create the backend and cluster
+        backend = BackendFactory.build(self)
+        backend.create_cluster()
+
+        # Set up the cluster
+        self._init_cluster()
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+# vi: ts=4 et:

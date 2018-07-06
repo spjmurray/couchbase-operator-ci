@@ -1,0 +1,5 @@
+[MESSAGES CONTROL]
+disable=
+  no-self-use,
+  too-few-public-methods,
+  superfluous-parens,
