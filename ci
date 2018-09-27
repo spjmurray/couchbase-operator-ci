@@ -6,6 +6,8 @@ Main Docker entry point, responsible for spinning up a Kubernetes cluster
 dynamically in the cloud with Kops and running tests against it with tco
 """
 
+import argparse
+import atexit
 import base64
 import configparser
 import errno
@@ -18,7 +20,6 @@ import string
 import subprocess
 import sys
 import time
-import unittest
 
 import boto3
 import kubernetes
@@ -31,56 +32,6 @@ OPERATOR_MNT_DIR = '/mnt/couchbase-operator'
 
 # Where we will make a working copy of the source
 OPERATOR_SRC_DIR = '/tmp/go/src/github.com/couchbase/couchbase-operator'
-
-class Argument(object):
-    """
-    Represents an environment argument
-    """
-    def __init__(self, name, required, default):
-        self.name = name
-        self.required = required
-        self.default = default
-
-
-class ArgumentList(object):
-    """
-    Holds parsed arguments, returns None if one doesn't exist
-    """
-    def __getattr__(self, key):
-        getattr(self.__dict__, key, None)
-
-
-class ArgumentParser(object):
-    """
-    Argument parser which has the same interface as argparse.ArgumentParser
-    but works on environment variables
-    """
-    def __init__(self):
-        self.arguments = []
-
-    def add_argument(self, name, required=False, default=None):
-        """Adds a named environment variable to the internal collection"""
-        self.arguments.append(Argument(name, required, default))
-
-    def print_error(self):
-        """Prints the expected environment variables and exits"""
-        required = [x.name for x in self.arguments if x.required]
-        logging.error("Required arguments: %s", ', '.join(required))
-        sys.exit(1)
-
-    def parse_args(self):
-        """Scans each defined argument, and parses into an output object"""
-        args = ArgumentList()
-        for argument in self.arguments:
-            try:
-                value = os.environ[argument.name]
-            except KeyError:
-                if argument.required:
-                    self.print_error()
-                elif argument.default != None:
-                    value = argument.default
-            setattr(args, argument.name.lower(), value)
-        return args
 
 
 class Executor(object):
@@ -157,8 +108,8 @@ class Kops(object):
     Wraps up kops commands
     """
 
-    def __init__(self, testcase):
-        self.testcase = testcase
+    def __init__(self, args):
+        self.args = args
 
     def create(self, state, arguments, cluster_name):
         """Create a cluster"""
@@ -173,10 +124,16 @@ class Kops(object):
         delete_comamnd = ['kops', 'delete', 'cluster', '--yes', '--state', state, cluster_name]
 
         logging.info('Creating cluster %s', cluster_name)
-        logging.warning(' '.join(delete_comamnd))
-
         Executor.execute(create_command)
-        #self.testcase.addCleanup(Executor.execute, delete_comamnd)
+
+        if self.args.clean:
+            def cleaner():
+                """Deletes a cluster"""
+                logging.info('Deleting cluster ...')
+                Executor.execute(delete_comamnd)
+            atexit.register(cleaner)
+        else:
+            logging.warning('To delete cluster run: %s', ' '.join(delete_comamnd))
 
         # Wait for the cluster to become available
         def callback():
@@ -194,28 +151,17 @@ class AWSBackend(object):
     """
     Backend for creating Kubernetes clusters in AWS
     """
-    def __init__(self, testcase):
-        self.testcase = testcase
-        self.args = None
-        self.suffix = None
+    def __init__(self, args):
+        self.args = args
         self.bucket_name = None
         self.kops_parameters = []
         self.kops_state = {}
         self.cluster_name = None
 
-    def _configure_aws_args(self):
-        """Parse environment specific parameters"""
-
-        parser = ArgumentParser()
-        parser.add_argument('AWS_REGION', required=True)
-        parser.add_argument('AWS_ACCESS_KEY', required=True)
-        parser.add_argument('AWS_SECRET_KEY', required=True)
-        self.args = parser.parse_args()
-
     def _configure_aws_command(self):
         """Configure the environment for use AWS"""
 
-        aws_config_dir = self.testcase.args.home + '/.aws'
+        aws_config_dir = self.args.home + '/.aws'
         aws_config_path = aws_config_dir + '/config'
         aws_credentials_path = aws_config_dir + '/credentials'
 
@@ -249,15 +195,22 @@ class AWSBackend(object):
         """Configure resources required for kops"""
 
         # Create an S3 bucket to hold the configuration
-        self.bucket_name = APP + '-' + self.testcase.suffix
+        self.bucket_name = APP + '-' + self.args.suffix
         logging.info('Creating bucket %s', self.bucket_name)
         aws_s3 = boto3.client('s3')
         aws_s3.create_bucket(Bucket=self.bucket_name)
-        #self.testcase.addCleanup(aws_s3.delete_bucket, Bucket=self.bucket_name)
+
+        if self.args.clean:
+            def cleaner():
+                """Deletes a bucket"""
+                logging.info('Deleting bucket ...')
+                aws_s3.delete_bucket(Bucket=self.bucket_name)
+            atexit.register(cleaner)
+        else:
+            cmd = 'aws s3api delete-bucket --bucket ' + self.bucket_name
+            logging.warning('To delete bucket run: %s', cmd)
 
         self.kops_state = 's3://' + self.bucket_name
-
-        logging.warning('aws s3api delete-bucket --bucket %s', self.bucket_name)
 
     def _configure_aws_kops(self):
         """Configures kops command line for AWS"""
@@ -276,7 +229,6 @@ class AWSBackend(object):
     def _configure(self):
         """Configures all kops pre-requisites"""
 
-        self._configure_aws_args()
         self._configure_aws_command()
         self._configure_aws_resources()
         self._configure_aws_kops()
@@ -285,9 +237,9 @@ class AWSBackend(object):
         """Perform all initialisation and create a cluster"""
 
         self._configure()
-        self.cluster_name = APP + '-' + self.testcase.suffix
+        self.cluster_name = APP + '-' + self.args.suffix
 
-        kops = Kops(self.testcase)
+        kops = Kops(self.args)
         kops.create(self.kops_state, self.kops_parameters, self.cluster_name)
 
 
@@ -297,11 +249,11 @@ class BackendFactory(object):
     """
 
     @staticmethod
-    def build(testcase):
+    def build(args):
         """Returns an initialized backend"""
-        if testcase.args.backend == 'aws':
-            return AWSBackend(testcase)
-        raise RuntimeError('Unknown backend ' + testcase.args.backend)
+        if args.backend == 'aws':
+            return AWSBackend(args)
+        raise RuntimeError('Unknown backend ' + args.backend)
 
 
 class ConsoleLogFilter(logging.Filter):
@@ -319,17 +271,14 @@ class ConsoleLogFilter(logging.Filter):
         return record.levelno >= logging.INFO
 
 
-class TestMain(unittest.TestCase):
+class Tester(object):
     """
     The main test case, this is a wrapper around the main go tests
     which creates an ephemeral cluster.
     """
 
-    def __init__(self, methodname='runTest'):
-        super(TestMain, self).__init__(methodname)
+    def __init__(self):
         self.args = None
-        self.suffix = None
-        self.tag = None
 
     def _init_logging(self):
         """Creates info logging to stdout and debug loggin to a log file"""
@@ -357,7 +306,7 @@ class TestMain(unittest.TestCase):
 
         # Generate a random suffix for resource names to avoid conflicts
         alphabet = string.ascii_lowercase + string.digits
-        self.suffix = ''.join(random.choice(alphabet) for i in range(0, 8))
+        setattr(self.args, 'suffix', ''.join(random.choice(alphabet) for i in range(0, 8)))
 
         # Generate an ephemeral SSH key
         logging.info('Creating ephemeral key pair')
@@ -365,10 +314,11 @@ class TestMain(unittest.TestCase):
 
         # Generate docker login information
         logging.info('Creating docker configuration')
+        docker_auth = self.args.docker_user + ':' + self.args.docker_api_key
         docker_config = {
             'auths': {
                 'https://index.docker.io/v1/': {
-                    'auth': base64.b64encode('spjmurray:' + self.args.docker_api_key),
+                    'auth': base64.b64encode(docker_auth),
                 },
             },
         }
@@ -405,18 +355,18 @@ class TestMain(unittest.TestCase):
         sha = sha.rstrip()
 
         # Calculate the image tag
-        self.tag = 'spjmurray/couchbase-operator:' + sha
+        setattr(self.args, 'tag', self.args.docker_repo + ':' + sha)
 
         # Build the operator docker image
         logging.info('Creating operator container image')
         env = os.environ.copy()
         env['GOPATH'] = '/tmp/go'
         Executor.execute(['make'], env=env)
-        Executor.execute(['docker', 'build', '.', '-t', self.tag])
+        Executor.execute(['docker', 'build', '.', '-t', self.args.tag])
 
         # Push it to a repository
-        logging.info('Pushing operator container image %s to docker hub', self.tag)
-        Executor.execute(['docker', 'push', self.tag])
+        logging.info('Pushing operator container image %s to docker hub', self.args.tag)
+        Executor.execute(['docker', 'push', self.args.tag])
 
     def _init_tco(self):
         """
@@ -475,7 +425,7 @@ class TestMain(unittest.TestCase):
                                     do
                                       sleep 60
                                     done
-                                    '''.format(self.tag),
+                                    '''.format(self.args.tag),
                                 ],
                                 volume_mounts=[
                                     kubernetes.client.V1VolumeMount(
@@ -521,15 +471,28 @@ class TestMain(unittest.TestCase):
 
         Waiter.wait_for('Operator image installing', callback)
 
-    def test_main(self):
+    def run(self):
         """Creates a cluster via kops and runs the test suite"""
 
-        # Parse the environment for common parameters
-        parser = ArgumentParser()
-        parser.add_argument('BACKEND', default='aws')
-        parser.add_argument('DOCKER_API_KEY', required=True)
-        parser.add_argument('HOME', required=True)
+        # Parse arguments
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--no-clean', dest='clean', action='store_false', default=True)
+        parser.add_argument('--backend', default='aws', choices=['aws'])
+
+        docker_group = parser.add_argument_group('docker')
+        docker_group.add_argument('--docker-user', required=True)
+        docker_group.add_argument('--docker-api-key', required=True)
+        docker_group.add_argument('--docker-repo', required=True)
+
+        aws_group = parser.add_argument_group('aws')
+        aws_group.add_argument('--aws-region', default='us-east-1')
+        aws_group.add_argument('--aws-access-key')
+        aws_group.add_argument('--aws-secret-key')
+
         self.args = parser.parse_args()
+
+        # Add implicit arguments
+        setattr(self.args, 'home', os.environ['HOME'])
 
         # Setup logging to standard out
         self._init_logging()
@@ -544,7 +507,7 @@ class TestMain(unittest.TestCase):
         self._init_tco()
 
         # Create the backend and cluster
-        backend = BackendFactory.build(self)
+        backend = BackendFactory.build(self.args)
         backend.create_cluster()
 
         # Set up the cluster
@@ -552,6 +515,6 @@ class TestMain(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main()
+    Tester().run()
 
 # vi: ts=4 et:

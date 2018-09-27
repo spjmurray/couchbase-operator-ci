@@ -1,3 +1,3 @@
 .PHONY: all
 all:
-	docker build . -t couchbase-operator-ci:0.0.1
+	docker build . -t spjmurray/couchbase-operator-ci:0.0.1

@@ -46,4 +46,4 @@ USER ${user}
 COPY ci /usr/local/bin/
 
 # Run the script
-CMD ["/usr/local/bin/ci"]
+ENTRYPOINT ["/usr/local/bin/ci"]

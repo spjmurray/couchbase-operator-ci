@@ -14,23 +14,23 @@ Nodes are secured with an ephemeral SSH key.  All APIs are secured via TLS. Node
 
     docker run \
       --rm \
-      --env DOCKER_API_KEY=${DOCKER_API_KEY} \
-      --env AWS_REGION=us-east-1 \
-      --env AWS_ACCESS_KEY=${AWS_ACCESS_KEY} \
-      --env AWS_SECRET_KEY=${AWS_SECRET_KEY} \
       --mount type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock \
       --mount type=bind,source=/home/simon/go/src/github.com/couchbase/couchbase-operator,target=/mnt/couchbase-operator,readonly \
-      --group-add ${HOST_DOCKER_GID} \
-      couchbase-operator-ci:0.0.1
+      --group-add $(grep docker /etc/group | cut -d: -f3) \
+      spjmurray/couchbase-operator-ci:0.0.1 \
+      --docker-user spjmurray \
+      --docker-api-key ${DOCKER_API_KEY} \
+      --docker-repo spjmurray/couchbase-operator \
+      --backend aws \
+      --aws-region us-east-1 \
+      --aws-access-key ${AWS_ACCESS_KEY} \
+      --aws-secret-key ${AWS_SECRET_KEY}
 
 ### Recomended Options
 
 <dl>
   <dt>--rm</dt>
   <dd>Clean the container up after exit</dd>
-
-  <dt>--env</dt>
-  <dd>Pass environment variables to the container.</dd>
 
   <dt>--mount</dt>
   <dd>The CI job needs to have access to docker and clone the repository so needs access to the local host file system.</dd>
